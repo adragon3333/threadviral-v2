@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, List, Optional
 
 from .config import (
-    AUDIO_EXTS, BG_EXTS, MAX_DISPLAY_CHARS, MAX_RENDER_SECONDS, MAX_SCENES,
+    APP_ROOT, AUDIO_EXTS, BG_EXTS, MAX_DISPLAY_CHARS, MAX_RENDER_SECONDS, MAX_SCENES,
     OUTPUTS_DIR, RESOLUTIONS, SAFE_ZONE_LEFT, SAFE_ZONE_RIGHT, TEMP_DIR, VIDEO_EXTS,
 )
 from PIL import Image
@@ -29,7 +29,7 @@ from .cards import (
 from .content import select_comments
 from .pacing import scene_duration
 from .qc import check_script, check_video
-from .tts import local_slang_to_tts, make_tts_audio
+from .tts import local_slang_to_tts, make_tts_audio, read_word_boundaries
 from .utils import (
     ffmpeg_bin, ffprobe_bin, get_media_duration, has_audio_stream, is_image_file,
     make_silence_aac, normalize_audio_to_aac, pad_audio, scene_to_dict,
@@ -198,12 +198,19 @@ def _resolve_media(requested: str, folder: str, exts: tuple) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Render chính
 # ---------------------------------------------------------------------------
+from .studio import StudioStyle
+from .html_cards import render_html_card, compose_overlay
+from .procedural import background_clip, ass_subtitles
+from .studio_pipeline import section_for, studio_frame, layer_frame, overlay_filter, video_layer_filter, sfx_mix, layer_window, scene_media_layers, scene_sfx_events, mix_scene_sfx
+
+
 async def render_video(req, progress: ProgressFn = None) -> dict:
     """
     Render video từ RenderRequest.
     Trả về {"status": "success", "video_url": ..., "duration": ...}
     """
     p = progress or _noop
+    studio = getattr(req, "studio_style", None) or StudioStyle()
 
     # Chuẩn hoá scenes về dict (hỗ trợ cả Pydantic model lẫn dict)
     scenes = [scene_to_dict(sc) for sc in (req.scenes or [])]
@@ -262,7 +269,7 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
         scenes = expanded
 
     # --- Hook ---
-    hook_text = (getattr(req, "hook_text", None) or "").strip()
+    hook_text = (getattr(req, "hook_text", None) or (studio.hook_text if studio.enabled else "")).strip()
     if hook_text:
         scenes.insert(0, {
             "author": "__hook__", "time_ago": "", "display_text": hook_text,
@@ -272,7 +279,7 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
         })
 
     # --- CTA ---
-    cta_text = (getattr(req, "cta_text", None) or "").strip()
+    cta_text = (getattr(req, "cta_text", None) or (studio.outro_text if studio.enabled else "")).strip()
     if cta_text:
         scenes.append({
             "author": "__cta__", "time_ago": "", "display_text": cta_text,
@@ -280,6 +287,10 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
             "reposts": "", "shares": "", "author_liked": False, "meme_file": "",
             "reply_display_text": None, "reply_tts_text": None, "reply_author": None,
         })
+
+    if studio.enabled and studio.cover_enabled:
+        title = studio.cover_title.strip() or next((s.get("display_text", "")[:250] for s in scenes if not s.get("author", "").startswith("__")), "")
+        scenes.insert(0, {"author": "__cover__", "display_text": title, "tts_text": "", "time_ago": ""})
 
     # --- Kích thước ---
     job_id = uuid.uuid4().hex[:8]
@@ -330,7 +341,18 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
 
         async def _tts_one(txt, vc, sp, path):
             nonlocal done_tts
-            r = await make_tts_audio(txt, vc, sp, path)
+            temp_files.extend([path + ".words.jsonl", path + ".raw.mp3"])
+            if studio.enabled and any(m["a1_path"] == path and m["scene"]["author"] == "__cover__" for m in scenes_meta):
+                make_silence_aac(path, studio.cover_seconds)
+                r = path
+            elif getattr(req, "studio_silent", False):
+                make_silence_aac(path, max(3, min(45, len(txt.split()) / 2.7)))
+                r = path
+            else:
+                try:
+                    r = await asyncio.wait_for(make_tts_audio(txt, vc, sp, path, strict_voice=True), timeout=120) if studio.enabled else await make_tts_audio(txt, vc, sp, path)
+                except (RuntimeError, TimeoutError) as exc:
+                    raise ValueError(f"Không tạo được giọng đọc đoạn {done_tts+1}/{total_tts}. Thử lại hoặc đổi giọng trong Giọng đọc.") from exc
             done_tts += 1
             await _safe_progress(p, 0.05 + 0.30 * (done_tts / total_tts),
                     f"Đang tạo giọng đọc TTS... ({done_tts}/{total_tts})")
@@ -352,7 +374,7 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
                     sz = os.path.getsize(ap)
                 except OSError:
                     sz = 0
-                if sz < 1024:
+                if sz < 1024 and not getattr(req, "studio_silent", False) and meta["scene"]["author"] != "__cover__":
                     silent_items.append((meta["idx"], key, sz))
 
         if silent_items:
@@ -386,16 +408,21 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
                 is_hook=(sc.get("author") == "__hook__"),
                 is_cta=(sc.get("author") == "__cta__"),
             )
+            if sc["author"] == "__cover__":
+                target_dur = studio.cover_seconds
+            words1 = read_word_boundaries(meta["a1_path"])
             extra = max(0.0, target_dur - raw_dur)
 
             # Pad audio TRƯỚC khi đo -> duration đo được khớp đúng timeline
             padded_a1 = pad_audio(meta["a1_path"], meta["a1_path"] + ".pad.aac",
-                                  SEG_PAD + extra)
+                                  (0 if sc["author"] == "__cover__" else SEG_PAD) + extra)
             meta["a1_path"] = padded_a1
             temp_files.append(padded_a1)
             dur1 = get_media_duration(padded_a1)
 
-            if sc["author"] == "__hook__":
+            if sc["author"] == "__cover__":
+                box1_img = Image.new("RGBA", (1, 1))
+            elif sc["author"] == "__hook__":
                 hook_img_path = draw_hook_card(sc["display_text"], vid_w, vid_h)
                 box1_img = Image.open(hook_img_path).convert("RGBA")
                 temp_files.append(hook_img_path)
@@ -422,10 +449,12 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
                     scale=card_scale, vid_w=vid_w, vid_h=vid_h,
                     is_verified=bool(sc.get("is_verified")),
                 )
+            if studio.enabled and not sc["author"].startswith("__"):
+                box1_img = await render_html_card(sc, studio, vid_w)
             box1_img.save(meta["c1_path"], "PNG")
 
             timeline_segments.append({
-                "type": "card", "img_path": meta["c1_path"],
+                "type": "card", "scene": sc, "words": words1, "img_path": meta["c1_path"],
                 "dur": dur1, "start": cur_time, "end": cur_time + dur1,
             })
             audio_segment_paths.append(meta["a1_path"])
@@ -433,6 +462,7 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
             last_card_path = meta["c1_path"]
 
             if meta["has_reply"]:
+                words2 = read_word_boundaries(meta["a2_path"])
                 padded_a2 = pad_audio(meta["a2_path"], meta["a2_path"] + ".pad.aac", SEG_PAD)
                 meta["a2_path"] = padded_a2
                 temp_files.append(padded_a2)
@@ -466,8 +496,8 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
                 last_card_path = meta["c2_path"]
 
                 timeline_segments.append({
-                    "type": "card", "img_path": meta["c2_path"],
-                    "dur": dur2, "start": cur_time, "end": cur_time + dur2,
+                    "type": "card", "scene": {**sc, "display_text": sc["reply_display_text"], "tts_text": sc.get("reply_tts_text") or sc["reply_display_text"]}, "img_path": meta["c2_path"],
+                    "words": words2, "dur": dur2, "start": cur_time, "end": cur_time + dur2,
                 })
                 audio_segment_paths.append(meta["a2_path"])
                 cur_time += dur2
@@ -503,9 +533,13 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
         await _safe_progress(p, 0.55, "Đang dựng timeline FFmpeg...")
 
         bg_input = _resolve_media(getattr(req, "bg_video_path", None), "backgrounds", BG_EXTS)
+        if studio.enabled and studio.background_mode != "video":
+            bg_input = await asyncio.to_thread(background_clip, studio)
         has_bg_video = bool(bg_input)
 
         bgm_input = _resolve_media(getattr(req, "bgm_path", None), "bgm", AUDIO_EXTS)
+        if studio.enabled and not getattr(req, "bgm_path", None):
+            bgm_input = None
         has_bgm = bool(bgm_input)
 
         # Gộp audio
@@ -557,6 +591,13 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
 
         # Overlay từng thẻ & meme
         for s_idx, seg in enumerate(timeline_segments):
+            if studio.enabled:
+                with Image.open(seg["img_path"]) as source_card:
+                    frame = studio_frame(source_card.convert("RGBA"), seg.get("scene", {}), studio, vid_w, vid_h)
+                overlay_path = str(TEMP_DIR / f"{job_id}_studio_{s_idx}.png")
+                frame.save(overlay_path)
+                temp_files.append(overlay_path)
+                seg["img_path"] = overlay_path
             cmd_inputs.extend(["-loop", "1", "-i", seg["img_path"]])
             v_card = cur_input_idx
             cur_input_idx += 1
@@ -583,7 +624,7 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
             _scrim_y = max(0, _oy - _scrim_pad)
             _scrim_w = min(vid_w - _scrim_x, _cw + _scrim_pad * 2)
             _scrim_h = min(vid_h - _scrim_y, _ch + _scrim_pad * 2)
-            if _scrim_w > 0 and _scrim_h > 0:
+            if not studio.enabled and _scrim_w > 0 and _scrim_h > 0:
                 _scrim_v = f"v_scrim_{s_idx}"
                 filter_parts.append(
                     f"[{last_v}]format=rgba,"
@@ -593,11 +634,35 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
                 )
                 last_v = _scrim_v
 
-            filter_parts.append(
-                f"[{last_v}][{v_card}:v]overlay={_ox}:{_oy}:"
-                f"enable='between(t,{seg['start']:.3f},{seg['end']:.3f})'[{v_next}];"
-            )
+            if studio.enabled:
+                _ox = _oy = 0
+            if studio.enabled:
+                filter_parts.append(overlay_filter(last_v, v_card, v_next, seg["start"], seg["end"], studio.transition if studio.transition != "cut" else "none", vid_h))
+            else:
+                filter_parts.append(f"[{last_v}][{v_card}:v]overlay={_ox}:{_oy}:enable='between(t,{seg['start']:.3f},{seg['end']:.3f})'[{v_next}];")
             last_v = v_next
+            if studio.enabled:
+                for li, layer in enumerate([*studio.layers, *scene_media_layers(seg.get("scene", {}))]):
+                    if layer.section != section_for(seg.get("scene", {})):
+                        continue
+                    layer_start, layer_end = layer_window(layer, seg)
+                    if layer_end <= layer_start:
+                        continue
+                    next_label = f"v_layer_{s_idx}_{li}"
+                    if layer.kind == "video":
+                        source = (APP_ROOT / layer.source.lstrip("/")).resolve()
+                        if not source.is_relative_to(APP_ROOT.resolve()) or not source.is_file() or source.suffix.lower() not in (".mp4", ".webm"):
+                            raise ValueError("Video B-roll không hợp lệ hoặc không tồn tại.")
+                        cmd_inputs.extend(["-stream_loop", "-1", "-i", str(source)])
+                        filter_parts.append(video_layer_filter(last_v, cur_input_idx, next_label, layer, layer_start, layer_end, vid_w, vid_h))
+                    else:
+                        layer_path = str(TEMP_DIR / f"{job_id}_layer_{s_idx}_{li}.png")
+                        layer_frame(layer, studio, vid_w, vid_h).save(layer_path)
+                        temp_files.append(layer_path)
+                        cmd_inputs.extend(["-loop", "1", "-i", layer_path])
+                        filter_parts.append(overlay_filter(last_v, cur_input_idx, next_label, layer_start, layer_end, layer.motion, vid_h))
+                    cur_input_idx += 1
+                    last_v = next_label
 
             if seg["type"] == "meme":
                 is_img = seg.get("is_image", False)
@@ -643,7 +708,15 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
             wm_y = f"{int(card_scale * 165)}+mod(t*95,{int(card_scale * 1150)})"
         else:
             wm_y = f"{int(card_scale * 165)}"
-        filter_parts.append(f"[{last_v}][{v_wm}:v]overlay='{wm_x}':'{wm_y}'[v_out]")
+        final_label = "studio_wm" if studio.enabled and studio.subtitle else "v_out"
+        filter_parts.append(f"[{last_v}][{v_wm}:v]overlay='{wm_x}':'{wm_y}'[{final_label}]")
+        if studio.enabled and studio.subtitle:
+            subtitle_file = TEMP_DIR / f"{job_id}_studio.ass"
+            ass_subtitles(timeline_segments, studio, vid_w, vid_h, subtitle_file)
+            temp_files.append(str(subtitle_file))
+            ass_path = str(subtitle_file).replace("\\", "/").replace(":", "\\:")
+            fonts_path = str(APP_ROOT / "assets/library/fonts").replace("\\", "/").replace(":", "\\:")
+            filter_parts.append(f";[studio_wm]ass=filename='{ass_path}':fontsdir='{fonts_path}'[v_out]")
 
         # Audio
         audio_inputs = ["-i", voice_merged]
@@ -654,7 +727,7 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
             audio_inputs.extend(["-stream_loop", "-1", "-i", bgm_input])
             v_bgm_idx = cur_input_idx
             cur_input_idx += 1
-            vol = max(0.01, min(1.0, float(getattr(req, "bgm_volume", 0.12) or 0.12)))
+            vol = max(0.0, min(1.0, float(getattr(req, "bgm_volume", 0.12))))
             # BGM loop vo han -> phai atrim ve do dai video, neu khong
             # amix se khong bao gio ket thuc va ffmpeg treo khong ghi
             # duoc moov atom (file MP4 hong, browser khong phai duoc).
@@ -670,9 +743,20 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
         # Chuẩn hoá độ lớn âm thanh theo chuẩn nền tảng (TikTok/FB/Reels
         # đều target ~-14 LUFS). Không có bước này giọng đọc bị nhỏ, người
         # xem phải vặn volume -> giảm tỉ lệ xem hết video.
-        audio_filter += (
-            ";[raw]loudnorm=I=-14:TP=-1.5:LRA=11[a_out]"
-        )
+        raw_label = "raw"
+        if studio.enabled and studio.sfx_volume > 0:
+            effects = scene_sfx_events(timeline_segments, studio)
+            extra_mix, sources = mix_scene_sfx(cur_input_idx, effects, studio.sfx_volume, total_dur)
+            for source in sources:
+                sound = (APP_ROOT / source.lstrip("/")).resolve()
+                if not sound.is_relative_to(APP_ROOT.resolve()) or not sound.is_file():
+                    raise ValueError("Không tìm thấy SFX đã chọn. Hãy chọn lại trong thư viện.")
+                audio_inputs.extend(["-i", str(sound)])
+                cur_input_idx += 1
+            if extra_mix:
+                audio_filter += extra_mix
+                raw_label = "with_sfx"
+        audio_filter += f";[{raw_label}]loudnorm=I=-14:TP=-1.5:LRA=11[a_out]"
 
         full_filter = "".join(filter_parts) + ";" + audio_filter
 
@@ -688,7 +772,8 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
             "-map", "[a_out]",
             "-t", f"{total_dur:.3f}",
             "-c:v", "libx264",
-            "-preset", "ultrafast",
+            "-preset", "veryfast" if studio.enabled else "ultrafast",
+            "-crf", "20",
             "-tune", "fastdecode",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
@@ -822,7 +907,17 @@ async def render_video(req, progress: ProgressFn = None) -> dict:
                 print(f"[QC] Khong kiem tra duoc video: {e}")
                 post_qc = None
 
+        poster_url = None
+        if studio.enabled:
+            poster = OUTPUTS_DIR / (job_id + "_poster.jpg")
+            probe_poster = await asyncio.to_thread(subprocess.run, [ffmpeg_bin(), "-y", "-loglevel", "error", "-ss", "0.3", "-i", out_path, "-frames:v", "1", "-update", "1", str(poster)], capture_output=True, timeout=30)
+            if probe_poster.returncode == 0:
+                poster_url = "/outputs/" + poster.name
+        timed = sum(bool(s.get("words")) for s in timeline_segments)
         return {
+            "poster_url": poster_url,
+            "caption_timing": "word_boundary" if timed and all(s.get("words") for s in timeline_segments if s.get("scene", {}).get("author") not in ("__cover__", "__hook__", "__cta__")) else "estimated",
+            "timeline": [{"start": round(s["start"], 3), "end": round(s["end"], 3), "section": section_for(s.get("scene", {})), "media": s.get("scene", {}).get("studio_media") or None} for s in timeline_segments],
             "status": "success",
             "video_url": f"/outputs/{out_name}",
             "filename": out_name,

@@ -7,6 +7,8 @@ Tách riêng khỏi server.py, bổ sung:
 """
 import asyncio
 import hashlib
+import json
+import shutil
 import os
 import random
 import re
@@ -265,7 +267,7 @@ def clear_tts_cache() -> int:
 # ---------------------------------------------------------------------------
 # Sinh audio TTS
 # ---------------------------------------------------------------------------
-async def make_tts_audio(text: str, voice: str, speed: str, out_path: str) -> str:
+async def make_tts_audio(text: str, voice: str, speed: str, out_path: str, *, strict_voice: bool = False) -> str:
     """
     Tạo file AAC từ văn bản. Có cache: nếu đã sinh trước đó thì copy lại.
     Trả về đường dẫn file đầu ra.
@@ -279,14 +281,16 @@ async def make_tts_audio(text: str, voice: str, speed: str, out_path: str) -> st
 
     cached = _cache_path(clean, voice, speed)
     # File AAC hop le >= 1KB. File nho hon la ket qua TTS that bai -> bo qua
-    if os.path.exists(cached) and os.path.getsize(cached) > 1024:
+    if os.path.exists(cached) and os.path.getsize(cached) > 1024 and (not strict_voice or os.path.isfile(cached + ".words.jsonl")):
         try:
             with open(cached, "rb") as src, open(out_path, "wb") as dst:
                 dst.write(src.read())
+            if os.path.isfile(cached + ".words.jsonl"):
+                shutil.copyfile(cached + ".words.jsonl", out_path + ".words.jsonl")
             return out_path
         except OSError:
             pass
-    elif os.path.exists(cached):
+    elif os.path.exists(cached) and os.path.getsize(cached) <= 1024:
         # Cache hong -> xoa de khong dung lai
         try:
             os.remove(cached)
@@ -298,19 +302,20 @@ async def make_tts_audio(text: str, voice: str, speed: str, out_path: str) -> st
 
     # Cac voice du phong: khi voice chinh bi rate-limit (NoAudioReceived),
     # doi sang voice khac de cau do van co giong doc.
-    voices_to_try = [voice] + [v for v in FALLBACK_VOICES if v != voice]
+    voices_to_try = [voice] if strict_voice else [voice] + [v for v in FALLBACK_VOICES if v != voice]
+    attempts = min(TTS_MAX_RETRIES, 3) if strict_voice else TTS_MAX_RETRIES
 
     # Giu so request TTS dong thoi o muc thap de tranh bi rate-limit
     async with _get_semaphore():
-        for attempt in range(TTS_MAX_RETRIES):
+        for attempt in range(attempts):
             # Doi voice xen ke: cau bi throttle o voice nao se thu voice khac
             cur_voice = voices_to_try[attempt % len(voices_to_try)]
             try:
                 await _wait_tts_turn()
                 if os.path.exists(raw_mp3):
                     os.remove(raw_mp3)
-                comm = edge_tts.Communicate(clean, cur_voice, rate=speed)
-                await comm.save(raw_mp3)
+                comm = edge_tts.Communicate(clean, cur_voice, rate=speed, boundary="WordBoundary")
+                await comm.save(raw_mp3, out_path + ".words.jsonl")
 
                 # File MP3 rong/nho => TTS that bai (edge_tts khong loi nhung
                 # tao file rong). Phai validate truoc khi dung.
@@ -329,8 +334,12 @@ async def make_tts_audio(text: str, voice: str, speed: str, out_path: str) -> st
 
                 # Luu vao cache de lan sau dung lai
                 try:
+                    if cur_voice != voice:
+                        raise OSError("Không cache giọng dự phòng dưới tên giọng yêu cầu")
                     with open(out_path, "rb") as src, open(cached, "wb") as dst:
                         dst.write(src.read())
+                    if cur_voice == voice:
+                        shutil.copyfile(out_path + ".words.jsonl", cached + ".words.jsonl")
                 except OSError:
                     pass
 
@@ -349,7 +358,7 @@ async def make_tts_audio(text: str, voice: str, speed: str, out_path: str) -> st
                         os.remove(raw_mp3)
                     except OSError:
                         pass
-                if attempt < TTS_MAX_RETRIES - 1:
+                if attempt < attempts - 1:
                     # Backoff luy thua co jitter de thoat khoi "burst throttle"
                     # cua edge-tts (loi NoAudioReceived xuat hien ngau nhien).
                     delay = min(
@@ -359,7 +368,11 @@ async def make_tts_audio(text: str, voice: str, speed: str, out_path: str) -> st
                     delay += random.uniform(0, TTS_RETRY_JITTER)
                     await asyncio.sleep(delay)
 
-    # Het so lan thu -> fallback an toan: im lang
+    if strict_voice:
+        # Studio exports must never replace narration with silence or another voice.
+        raise RuntimeError("Dịch vụ Edge-TTS chưa tạo được giọng đã chọn. Hãy thử lại hoặc đổi giọng trong Giọng đọc.") from last_err
+
+    # Legacy behavior: retain silence fallback for callers outside Studio.
     make_silence_aac(out_path, 1.0)
     if os.path.exists(raw_mp3):
         try:
@@ -368,6 +381,25 @@ async def make_tts_audio(text: str, voice: str, speed: str, out_path: str) -> st
             pass
     print(f"[TTS] that bai sau nhieu lan thu cho '{clean[:40]}': {last_err}")
     return out_path
+
+
+def read_word_boundaries(audio_path: str) -> list[dict]:
+    """Read Edge word timestamps in seconds; ignore malformed/old metadata."""
+    try:
+        result = []
+        with open(audio_path + ".words.jsonl", encoding="utf-8") as stream:
+            for line in stream:
+                item = json.loads(line)
+                if item.get("type") != "WordBoundary":
+                    continue
+                start = float(item["offset"]) / 10_000_000
+                duration = float(item["duration"]) / 10_000_000
+                if start < 0 or duration <= 0 or not item.get("text"):
+                    continue
+                result.append({"text": str(item["text"]), "start": start, "end": start + duration})
+        return sorted(result, key=lambda row: row["start"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
 
 
 async def make_tts_audio_batch(items: List, voice: str, speed: str) -> List[str]:

@@ -1,0 +1,99 @@
+{
+  "source": "Observed configuration UI",
+  "subtitlePresets": [
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Hoa nhấn vàng (Đậm đanh) · Karaoke · Đậm đanh · Nảy"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Hoa nén nhấn vàng · Karaoke · Nén cao · Tĩnh"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Hoa áp phích nhấn vàng · Karaoke · Áp phích · Đập"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Bo tròn nền đỏ · Karaoke · Bo tròn · Nhún"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Hoa ngắn dứt khoát · Một từ · Đậm đanh · Nảy"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Bo tròn trắng tinh · Karaoke · Bo tròn · Tĩnh"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Hoa hình học nhấn vàng · Karaoke · Hình học · Trồi lên"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Hoa 3 từ nhấn vàng · Karaoke · Hình học · Nảy"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Mềm nền đỏ · Karaoke · Mềm · Rơi xuống"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Một từ nền đỏ · Một từ · Bo tròn · Nảy"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Bong bóng toàn vàng · Karaoke · Bong bóng · Tĩnh"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Bo tròn bảng neon · Karaoke · Bo tròn · Trồi lên"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Bong bóng phát sáng · Karaoke · Bong bóng · Nảy"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Mềm dải màu tươi · Karaoke · Mềm · Nhún"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Bo tròn truyện tranh · Karaoke · Bo tròn · Đập"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Phối chữ · Vàng · Phối chữ · Có chân · Nảy"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Phối chữ · Tươi · Phối chữ · Bo tròn · Trồi lên"
+    },
+    {
+      "font": "\"Bricolage VF\", \"Be Vietnam Pro Local\", \"Be Vietnam Pro\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", system-ui, sans-serif",
+      "label": "Phối chữ · Sân khấu · Phối chữ · Áp phích · Đập"
+    }
+  ],
+  "proceduralBackgrounds": [
+    "Lưới sóng nước",
+    "Sóng S uốn lượn",
+    "Lưới kẻ ô (chạy)",
+    "Đường hầm 2 khung",
+    "Lưới 3D gợn sóng",
+    "Hạt sáng bay",
+    "Tốc độ ánh sáng",
+    "Đường đồng mức",
+    "Mạng lưới trôi",
+    "Mưa vạch dọc",
+    "Bụi sáng xoay"
+  ],
+  "filmEffects": [
+    "Phim cũ",
+    "Hạt mịn 35mm",
+    "Hoài cổ sepia",
+    "Super 8",
+    "Băng VHS",
+    "Phim hỏng"
+  ],
+  "note": "These are code-generated UI presets, not downloadable video files. Labels inventoried; implementation remains separate."
+}

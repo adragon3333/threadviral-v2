@@ -302,7 +302,7 @@ SCENE_FIELDS = (
     "author", "time_ago", "display_text", "tts_text",
     "reply_author", "reply_display_text", "reply_tts_text",
     "avatar_url", "likes", "comments", "reposts", "shares",
-    "author_liked", "meme_file",
+    "author_liked", "meme_file", "studio_media",
 )
 
 

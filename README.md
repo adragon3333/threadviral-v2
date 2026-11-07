@@ -167,3 +167,12 @@ tvcore/
 - Chỉ đổi/xoá watermark của bên khác khi **được phép**
 - Nội dung bình luận giữ nguyên ý nghĩa gốc, không bịa
 - Bản quyền media (video nền, nhạc) thuộc về chủ sở hữu tương ứng
+
+
+## Studio local (bản triển khai 05/11/2026)
+
+- Mở `http://127.0.0.1:8000/studio`; kho tài nguyên ở `/resources`.
+- Có 18 preset phụ đề, minh họa theo cảnh, thời gian vào/ra lớp, B-roll/SFX và xuất MP4.
+- Nhật ký SQLite giữ lịch sử/retry sau restart; không tự chạy lại job bị gián đoạn.
+- Gợi ý local dùng quy tắc. Gemini/GPT hiện dùng cầu nối prompt/JSON thủ công, chưa điều khiển tài khoản web tự động.
+- Chi tiết phạm vi, kiểm thử và giới hạn: [docs/STUDIO_NEXT_2026-11-05.md](docs/STUDIO_NEXT_2026-11-05.md).

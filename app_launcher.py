@@ -93,8 +93,28 @@ extract_defaults()
 from server import app  # noqa: E402
 import uvicorn  # noqa: E402
 
-HOST = "127.0.0.1"
-PORT = 8000
+import socket
+
+def get_free_port(host: str, preferred_port: int) -> int:
+    def _is_free(p: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, p))
+                return True
+            except OSError:
+                return False
+
+    if _is_free(preferred_port):
+        return preferred_port
+    print(f"[Warning] Cong {preferred_port} dang bi chiem boi ung dung khac. Dang tim cong thay the...")
+    for candidate in [8001, 8080, 8088, 8002, 8888, 8081]:
+        if _is_free(candidate):
+            print(f"[Info] Da chon cong thay the: {candidate}")
+            return candidate
+    return preferred_port
+
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = get_free_port(HOST, int(os.environ.get("PORT", "8000")))
 
 
 def open_browser():

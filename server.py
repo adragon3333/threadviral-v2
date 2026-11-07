@@ -14,12 +14,18 @@ Cấu trúc:
 """
 import asyncio
 import os
+from pathlib import Path
 import shutil
 import sys
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
+from tvcore.studio import StudioStyle, StudioSceneMedia, catalogue
+from tvcore.media_planner import MediaPlan
+from tvcore.voices import reference_voices, validate_synthesis_voice
+from tvcore.html_cards import card_html
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -42,10 +48,10 @@ from tvcore.render import render_video
 from tvcore.scrape import clear_scrape_cache, discover_posts, scrape_threads_post
 from tvcore.script import auto_generate_script
 from tvcore.tts import (
-    AVAILABLE_VOICES, clear_tts_cache, convert_tts_with_gemini, local_slang_to_tts,
+    AVAILABLE_VOICES, clear_tts_cache, convert_tts_with_gemini, local_slang_to_tts, make_tts_audio,
 )
 from tvcore.uploads import UploadError, build_dest, validate_upload
-from tvcore.utils import scene_to_dict
+from tvcore.utils import scene_to_dict, ffmpeg_bin
 
 # ---------------------------------------------------------------------------
 # Khởi tạo môi trường
@@ -67,7 +73,13 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-app = FastAPI(title="Ghiền Đọc Comment - AI Video Maker", version="3.0")
+@asynccontextmanager
+async def app_lifespan(app):
+    jobs.initialize(recover=True)
+    yield
+
+
+app = FastAPI(title="Ghiền Đọc Comment - AI Video Maker", version="3.1", lifespan=app_lifespan)
 
 # Chỉ cho 1 render chạy đồng thời (tránh tranh chấp edge-tts + CPU).
 # Được tạo lazily vì asyncio.Lock cần event loop.
@@ -91,6 +103,8 @@ app.mount("/backgrounds", StaticFiles(directory=str(BACKGROUNDS_DIR)), name="bac
 # DATA MODELS
 # ==========================================
 class SceneItem(BaseModel):
+    studio_media: Optional[StudioSceneMedia] = None
+    selected: bool = True
     author: str = ""
     time_ago: str = "1 ngày"
     display_text: str = ""
@@ -194,6 +208,11 @@ class TimelineRequest(BaseModel):
 
 
 class RenderRequest(BaseModel):
+    client_request_id: Optional[str] = Field(default=None, max_length=80)
+    retry_of: Optional[str] = Field(default=None, max_length=80)
+    studio_style: StudioStyle = Field(default_factory=StudioStyle)
+    auto_hook: bool = True
+    studio_silent: bool = False
     scenes: List[SceneItem]
     voice: str = "vi-VN-HoaiMyNeural"
     speed: str = "+20%"
@@ -218,6 +237,14 @@ class RenderRequest(BaseModel):
     zoom_effect: bool = True            # hiệu ứng zoom nhẹ
     skip_qc: bool = False               # bỏ qua kiểm tra chất lượng
 
+    @field_validator("speed")
+    @classmethod
+    def rate_format(cls, value):
+        import re
+        if not re.fullmatch(r"[+-]\d{1,3}%", value) or not -50 <= int(value[:-1]) <= 100:
+            raise ValueError("Nhịp đọc phải là phần trăm có dấu, trong khoảng -50% đến +100%")
+        return value
+
     @field_validator("resolution", mode="before")
     @classmethod
     def _check(cls, v):
@@ -230,14 +257,159 @@ class RenderRequest(BaseModel):
     @classmethod
     def _check_voice(cls, v):
         """Chỉ chấp nhận 2 giọng đọc có sẵn của tool."""
-        if v not in AVAILABLE_VOICES:
-            return AVAILABLE_VOICES[0]["id"]
-        return v
+        return validate_synthesis_voice(v)
 
 
 class DiscoverRequest(BaseModel):
     keyword: str = ""
     max_posts: int = Field(default=10, ge=1, le=30)
+
+
+class StudioProject(BaseModel):
+    version: int = Field(default=1, ge=1, le=1)
+    style: StudioStyle = Field(default_factory=StudioStyle)
+    scenes: List[SceneItem] = Field(default_factory=list, max_length=MAX_SCENES)
+    voice: str = "vi-VN-HoaiMyNeural"
+    speed: str = "+0%"
+    bg: str = Field(default="random", max_length=300)
+    bgm: Optional[str] = Field(default=None, max_length=300)
+    volume: float = Field(default=.12, ge=0, le=.5)
+    watermark: str = Field(default="", max_length=150)
+    resolution: str = "1080x1920"
+    silent: bool = False
+
+    @field_validator("voice")
+    @classmethod
+    def project_voice(cls, value):
+        return validate_synthesis_voice(value)
+
+    @field_validator("speed")
+    @classmethod
+    def project_rate(cls, value):
+        return RenderRequest.rate_format(value)
+
+
+class VoicePreviewRequest(BaseModel):
+    text: str = Field(default="Chào bạn. Đây là giọng đọc cho video của bạn.", min_length=1, max_length=300)
+    voice: str = "vi-VN-HoaiMyNeural"
+    speed: str = "+0%"
+
+    @field_validator("voice")
+    @classmethod
+    def allowed_voice(cls, value):
+        if value not in {voice["id"] for voice in AVAILABLE_VOICES}:
+            raise ValueError("Giọng đọc không được hỗ trợ")
+        return value
+
+
+    @field_validator("speed")
+    @classmethod
+    def allowed_speed(cls, value):
+        if value not in ("-10%", "+0%", "+10%", "+20%", "+30%"):
+            raise ValueError("Nhịp đọc không được hỗ trợ")
+        return value
+
+
+class AutomationRequest(BaseModel):
+    scenes: List[SceneItem] = Field(max_length=MAX_SCENES)
+    broll: bool = True
+    sticker: bool = True
+    sfx: bool = True
+
+
+class AutomationApplyRequest(AutomationRequest):
+    plan: MediaPlan
+
+
+@app.post("/api/studio/automation/suggest")
+async def automation_suggest(req: AutomationRequest):
+    from tvcore.media_planner import suggest_plan, ai_prompt
+    if not req.scenes:
+        raise HTTPException(status_code=400, detail="Thêm nội dung trước khi tạo gợi ý.")
+    scenes = [s.model_dump() for s in req.scenes]
+    plan = suggest_plan(scenes, req.broll, req.sticker, req.sfx)
+    return {"plan": plan, "prompt": ai_prompt(scenes, plan)}
+
+
+@app.post("/api/studio/automation/apply")
+async def automation_apply(req: AutomationApplyRequest):
+    from tvcore.media_planner import apply_plan
+    plan = req.plan.model_dump()
+    try:
+        scenes = apply_plan([s.model_dump() for s in req.scenes], plan)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"scenes": scenes, "source": plan.get('source')}
+
+
+
+@app.post("/api/studio/voice-preview")
+async def studio_voice_preview(req: VoicePreviewRequest):
+    import hashlib
+    key = hashlib.sha256((req.voice+req.speed+req.text).encode()).hexdigest()[:20]
+    path = OUTPUTS_DIR / ("voice_preview_" + key + ".aac")
+    try:
+        await asyncio.wait_for(make_tts_audio(req.text, req.voice, req.speed, str(path), strict_voice=True), timeout=120)
+    except (RuntimeError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail="Chưa tạo được giọng nghe thử. Bạn có thể thử lại hoặc đổi giọng.") from exc
+    finally:
+        path.with_suffix(path.suffix + ".words.jsonl").unlink(missing_ok=True)
+        path.with_suffix(path.suffix + ".raw.mp3").unlink(missing_ok=True)
+    return {"audio_url": "/outputs/" + path.name}
+
+
+@app.get("/api/studio/voices")
+async def studio_voices():
+    return {"synthesis": [{**voice, "can_synthesize": True} for voice in AVAILABLE_VOICES],
+            "reference": reference_voices(), "reference_can_synthesize": False}
+
+
+@app.post("/api/studio/project/validate")
+async def studio_project_validate(project: StudioProject):
+    # Reuse the render model's voice and resolution normalization.
+    req = RenderRequest(scenes=project.scenes, voice=project.voice, speed=project.speed, resolution=project.resolution)
+    data = project.model_dump()
+    data.update(voice=req.voice, speed=req.speed, resolution=req.resolution)
+    return data
+
+
+@app.post("/api/studio/preflight")
+async def studio_preflight(req: RenderRequest):
+    errors, warnings = [], []
+    if not req.scenes or not any(s.display_text.strip() for s in req.scenes):
+        errors.append("Chưa có nội dung để dựng video.")
+    if len(req.scenes) > MAX_SCENES:
+        errors.append(f"Tối đa {MAX_SCENES} cảnh.")
+    if any(not s.display_text.strip() for s in req.scenes):
+        errors.append("Có cảnh đang trống nội dung.")
+    style = req.studio_style
+    sources = [l.source for l in style.layers if l.kind in ("image", "video") and l.source]
+    if style.background_mode == "image":
+        sources.append(style.background_image)
+    if style.sfx_source:
+        sources.append(style.sfx_source)
+    for scene in req.scenes:
+        media = scene.studio_media
+        if media and media.enabled:
+            sources.extend(p for p in (media.broll_source, media.sticker_source, media.sfx_source) if p)
+            count = sum(l.section == 'body' for l in style.layers)+2+bool(media.broll_source)+bool(media.sticker_source)
+            if count > 20:
+                errors.append("Cảnh có hơn 20 lớp sau khi thêm tài nguyên tự động. Bớt lớp hoặc tắt minh họa của cảnh.")
+    for source in sources:
+        path = (APP_ROOT / source.lstrip("/")).resolve()
+        if not source or not path.is_relative_to(APP_ROOT.resolve()) or not path.is_file():
+            errors.append("Tài nguyên đã chọn không tồn tại: " + source)
+    if not req.studio_silent:
+        warnings.append("Giọng đọc cần kết nối Edge-TTS; tác vụ sẽ báo lỗi nếu dịch vụ không đáp ứng.")
+    else:
+        warnings.append("Đang bật chế độ dựng thử không giọng đọc.")
+    if req.bgm_path:
+        warnings.append("Nhạc crawl là bản preview và được lặp khi cần.")
+    if not ffmpeg_bin():
+        errors.append("Không tìm thấy FFmpeg.")
+    return {"ok": not errors, "errors": errors, "warnings": warnings,
+            "scenes": len(req.scenes), "sections": {"cover": style.cover_enabled, "hook": bool(style.hook_text.strip())},
+            "sfx": bool(style.sfx_source)}
 
 
 # ==========================================
@@ -521,8 +693,13 @@ async def render_api(req: RenderRequest):
     if len(req.scenes) > MAX_SCENES:
         raise HTTPException(status_code=400, detail=f"Quá nhiều cảnh (tối đa {MAX_SCENES}).")
 
+    if req.studio_style.enabled:
+        preflight = await studio_preflight(req)
+        if not preflight["ok"]:
+            raise HTTPException(status_code=400, detail=" · ".join(preflight["errors"]))
+
     # Tự động sinh hook/CTA nếu người dùng chưa nhập
-    if not (req.hook_text or "").strip() or not (req.cta_text or "").strip():
+    if req.auto_hook and (not (req.hook_text or "").strip() or not (req.cta_text or "").strip()):
         try:
             gen = await auto_generate_hook_cta(
                 [scene_to_dict(s) for s in req.scenes],
@@ -536,18 +713,24 @@ async def render_api(req: RenderRequest):
         except Exception as e:
             print(f"[AutoHook] that bai, bo qua: {e}")
 
-    job = await jobs.create_job()
+    try:
+        job, created = await jobs.enqueue(req.model_dump(exclude={"gemini_api_key"}))
+    except jobs.QueueFull as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except jobs.RequestConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not created:
+        return {"status": job.status, "job_id": job.id}
 
     async def _run():
         try:
-            job.status = "running"
             await jobs.update_job(job.id, 0.01, "Đang chờ hàng đợi render...")
 
             # Chỉ cho tối đa 1 render chạy đồng thời.
             # Nhiều job song song sẽ tranh chấp edge-tts (sinh file im lặng)
             # và CPU (ffmpeg bị treo) -> video hỏng / không xuất được.
             async with _get_render_lock():
-                job.status = "running"
+                await jobs.start_job(job.id)
 
                 async def progress(pct: float, msg: str):
                     await jobs.update_job(job.id, pct, msg)
@@ -583,6 +766,21 @@ async def render_api(req: RenderRequest):
 
     asyncio.create_task(_run())
     return {"status": "queued", "job_id": job.id}
+
+
+@app.post("/api/render/{job_id}/retry")
+async def retry_render(job_id: str):
+    job = jobs.get_job(job_id)
+    if not job or not job.request:
+        raise HTTPException(status_code=404, detail="Không còn cấu hình của tác vụ này.")
+    if job.status != "error":
+        raise HTTPException(status_code=409, detail="Chỉ thử lại tác vụ đã thất bại hoặc bị gián đoạn.")
+    existing = jobs.active_retry(job_id)
+    if existing:
+        return {"status": existing.status, "job_id": existing.id}
+    import uuid
+    payload = {**job.request, "client_request_id": uuid.uuid4().hex, "retry_of": job_id}
+    return await render_api(RenderRequest(**payload))
 
 
 @app.get("/api/render/{job_id}/status")
@@ -829,8 +1027,9 @@ async def api_clear_cache():
 
 @app.get("/api/storage")
 async def api_storage():
-    """Thong tin dung luong: video da xuat, dung luong outputs/."""
+    """Thong tin dung luong: video da xuat, dung luong outputs/ (tu dong xoa sau 24h)."""
     try:
+        cleanup_old_videos()
         videos = sorted(
             OUTPUTS_DIR.glob("*.mp4"),
             key=lambda f: f.stat().st_mtime, reverse=True)
@@ -847,6 +1046,17 @@ async def api_storage():
     }
 
 
+@app.delete("/api/storage/{filename}")
+async def api_storage_delete(filename: str):
+    """Xoa mot video cu the trong outputs/."""
+    safe_name = Path(filename).name
+    target = OUTPUTS_DIR / safe_name
+    if target.exists() and target.suffix.lower() == ".mp4":
+        target.unlink(missing_ok=True)
+        return {"status": "success", "message": f"Đã xóa video {safe_name}"}
+    raise HTTPException(status_code=404, detail="Không tìm thấy video cần xóa.")
+
+
 @app.post("/api/storage/clean")
 async def api_storage_clean():
     """Xoa cac video cu, chi giu lai MAX_OUTPUT_VIDEOS video moi nhat."""
@@ -855,15 +1065,48 @@ async def api_storage_clean():
             "video_count": len(list(OUTPUTS_DIR.glob("*.mp4")))}
 
 
+app.mount("/studio-files", StaticFiles(directory=str(APP_ROOT / "studio")), name="studio-files")
+app.mount("/assets", StaticFiles(directory=str(APP_ROOT / "assets")), name="studio-assets")
+
+@app.get("/studio")
+@app.get("/threads/setup")
+async def studio_page():
+    return FileResponse(str(APP_ROOT / "index.html"))
+
+@app.get("/resources")
+async def resource_page():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse("/")
+
+@app.get("/api/studio/resources")
+async def studio_resources():
+    manifest = APP_ROOT / "assets/library/resources-manifest.json"
+    import json
+    return json.loads(manifest.read_text(encoding="utf-8"))
+
+class CardPreviewRequest(BaseModel):
+    scene: SceneItem
+    style: StudioStyle = Field(default_factory=StudioStyle)
+
+@app.post("/api/studio/card", response_class=HTMLResponse)
+async def studio_card(req: CardPreviewRequest):
+    return card_html(req.scene.model_dump(), req.style)
+
 @app.get("/")
 async def index_page():
-    """Phục vụ trang chủ index.html."""
-    for candidate in (WORK_ROOT / "index.html", APP_ROOT / "index.html"):
-        if candidate.exists():
-            return FileResponse(str(candidate))
-    raise HTTPException(status_code=404, detail="Không tìm thấy index.html")
-
+    """Phục vụ giao diện Studio trực tiếp tại root URL /."""
+    studio_file = APP_ROOT / "studio/index.html"
+    if studio_file.exists():
+        return FileResponse(str(studio_file))
+    return FileResponse(str(APP_ROOT / "index.html"))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+    import socket
+    port = int(os.environ.get("PORT", "8000"))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            port = 8001
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

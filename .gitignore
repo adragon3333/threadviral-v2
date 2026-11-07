@@ -68,3 +68,7 @@ Thumbs.db
 
 ===== Bien moi (keep) =====
 # .cursor/ va assets/ duoc giu de AI hieu quy tac + icon
+ 
+.playwright/
+data/
+*.bak

@@ -1,47 +1,66 @@
-"""Tien ich: don video cu trong outputs/ (gioi han so luong file ton tai)."""
+"""Tiện ích: dọn video cũ trong outputs/ (giới hạn số lượng và tự động xóa sau 24h)."""
 import os
 import time
 from typing import List, Optional, Tuple
 
 from .config import OUTPUTS_DIR
 
-# Chi giu N video moi nhat trong outputs/. Video cu hon se bi xoa de
-# tranh vie thu muc phinh to len vo han (1 video TikTok ~30-60MB).
 MAX_OUTPUT_VIDEOS = 30
+
+
+def cleanup_expired_24h_videos() -> Tuple[int, int]:
+    """Tự động xóa các video xuất ra đã cũ hơn 24 giờ (86.400s) để giải phóng dung lượng."""
+    if not OUTPUTS_DIR.exists():
+        return 0, 0
+    now = time.time()
+    removed = 0
+    freed = 0
+    try:
+        for f in OUTPUTS_DIR.iterdir():
+            if f.is_file() and f.suffix.lower() == ".mp4":
+                # Kiem tra neu qua 24 gio (86400 giay)
+                if now - f.stat().st_mtime > 86400:
+                    sz = f.stat().st_size
+                    f.unlink(missing_ok=True)
+                    removed += 1
+                    freed += sz
+    except OSError:
+        pass
+    return removed, freed // (1024 * 1024)
 
 
 def cleanup_old_videos(max_keep: int = MAX_OUTPUT_VIDEOS,
                        keep_names: Optional[List[str]] = None) -> Tuple[int, int]:
     """
-    Xoa cac video cu trong outputs/, chi giu `max_keep` video moi nhat.
-
-    `keep_names`: danh sach ten file KHONG duoc xoa (vd video vua render).
-    Tra về (so_file_da_xoa, so_mb_da_giai_phong).
+    Xóa các video cũ hơn 24 giờ và các video vượt quá `max_keep` video mới nhất.
     """
     if not OUTPUTS_DIR.exists():
         return 0, 0
+
+    # 1. Tu dong xoa cac video cu hon 24h truoc
+    removed_24h, freed_24h = cleanup_expired_24h_videos()
 
     try:
         files = [f for f in OUTPUTS_DIR.iterdir()
                  if f.is_file() and f.suffix.lower() == ".mp4"]
     except OSError:
-        return 0, 0
+        return removed_24h, freed_24h
 
     if len(files) <= max_keep:
-        return 0, 0
+        return removed_24h, freed_24h
 
     # Moi nhat truoc
     files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
     keep = set(keep_names or [])
-    removed = 0
-    freed = 0
+    removed = removed_24h
+    freed = freed_24h * 1024 * 1024
     for f in files[max_keep:]:
         if f.name in keep:
             continue
         try:
             sz = f.stat().st_size
-            f.unlink()
+            f.unlink(missing_ok=True)
             removed += 1
             freed += sz
         except OSError:
